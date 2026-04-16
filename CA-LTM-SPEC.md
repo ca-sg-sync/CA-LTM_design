@@ -567,8 +567,8 @@ The orchestrator is **checkpoint-based**, not end-of-session based. OpenClaw ses
 
 #### A. Recall Flow (before/near turn start)
 1. Identify session → load `SessionState`
-2. Classify task type: `code_truth` | `institutional_memory` | `mixed`
-3. Query CA-LTM for relevant records
+2. Classify task type (see §8.5)
+3. Query CA-LTM for relevant records (scoped by task type)
 4. Query Sourcegraph when code truth is needed
 5. Assemble context bundle
 
@@ -624,6 +624,46 @@ For each meaningful turn:
 8. Very recent conversational window
 
 **Pruning rule:** Include only what helps the model decide the *next correct action*.
+
+### 8.5 Task Classification
+
+The orchestrator classifies each turn into a **task type** that determines which data sources to query and which record types to prioritize during retrieval.
+
+```typescript
+type TaskType =
+  | "code_truth"
+  | "institutional_memory"
+  | "mixed"
+  | "operational"
+  | "compliance"
+  | "investigation"
+  | "domain_lookup";
+```
+
+#### Classification Profiles
+
+| TaskType | Purpose | Queries CA-LTM? | Queries Sourcegraph? | Priority Record Types |
+|---|---|---|---|---|
+| `code_truth` | Live code navigation: "where is", "what calls", "find references" | No | Yes | — |
+| `institutional_memory` | Organizational knowledge: "why do we", "what pattern", "what was decided" | Yes | No | migration, pattern, decision, incident, session_note |
+| `mixed` | Cross-cutting or ambiguous queries (default) | Yes | Yes | All |
+| `operational` | Real-time ops: alerts, degradation, service health | Yes | No | playbook, alert_pattern, incident_cluster, detection_caveat |
+| `compliance` | Regulatory and policy constraints: PCI, GDPR, SOX, data classification | Yes | No | decision, pattern, glossary |
+| `investigation` | Active triage and diagnosis: "diagnose", "troubleshoot", "root cause" | Yes | Yes | playbook, incident, alert_pattern, detection_caveat |
+| `domain_lookup` | Business terminology: "define", "what does X mean", glossary lookups | Yes | No | glossary, decision |
+
+#### Why Seven Types, Not Three
+
+The original three types (`code_truth`, `institutional_memory`, `mixed`) only controlled **which system** to query. The expanded set also controls **which record types** to prioritize during retrieval. This matters because:
+
+- **Operational** questions should surface playbooks and alert patterns, not migration records or glossary terms.
+- **Compliance** questions should surface decisions and patterns tagged with regulatory context, not incident history.
+- **Investigation** needs both CA-LTM (historical incidents, playbooks) and Sourcegraph (code paths), but scoped to operational record types.
+- **Domain lookups** should hit glossary records directly, not return noise from every record type.
+
+Without scoped retrieval, the system returns the same ranked list regardless of intent — acceptable at small scale, but increasingly noisy as the memory store grows.
+
+**Default:** `mixed` — the safest fallback, queries everything.
 
 ---
 
