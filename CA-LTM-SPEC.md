@@ -32,6 +32,7 @@ OpenClaw's memory ecosystem has evolved rapidly, but every existing solution sol
 | **memory-lancedb-pro** (community) | Hybrid retrieval (vector + BM25), reranking, recency weighting, memory decay, multi-scope isolation. | The most advanced "drop-in brain" available — but still fundamentally "better search over stored text." No session state layer, no explicit objective/plan tracking, no typed records. |
 | **Mem0 / @mem0/openclaw-mem0** | Enforced memory at the system layer. Automatically captured and injected every turn. Removes "agent forgot to store memory." | Still mostly "facts about user/system." No working-state layer, no structured context hierarchy, no operational context awareness. |
 | **Triple-memory / ShadowDB hybrids** | Combine vector memory + structured notes + file-based workspace. Reduce token duplication. | Closer to the goal, but still no full context model. No promotion pipeline, no verification, no typed institutional records. |
+| **Obsidian-based memory** | Local Markdown files with `[[wiki-links]]`, graph visualization of note relationships, rich plugin ecosystem. Human-readable, no lock-in. | No typed schemas, no structured retrieval, no session state, no promotion pipeline, no verification or staleness management. The graph is powerful for visualizing connections but edges are untyped and undirected. Becomes a landfill at scale — the agent reads/writes files but has no lifecycle governance over what accumulates. |
 
 **The common gap across all of these:**
 
@@ -530,6 +531,168 @@ SK = "{sourceType}#{sourceId}#{relationType}#{targetType}#{targetId}"
 
 - Applied to `session_note` records via DynamoDB TTL attribute.
 - Durable records do not expire.
+
+### 6.7 Event Log — Event-Sourced History
+
+CA-LTM maintains an **append-only event log** that captures every mutation to the system. The event log is the source of truth — the records table (`ca-ltm-records`) is a materialized projection that can be rebuilt from scratch by replaying events, similar to git.
+
+#### Why Event Sourcing
+
+1. **Auditability** — every change is traceable: who changed what, when, why, from which session
+2. **Replay & reconstruction** — rebuild the entire records table from the event log at any point in time
+3. **Debugging & tuning** — replay session state evolution to analyze context assembly effectiveness
+4. **Visualization** — animate knowledge graph growth, show record lifecycles, track session behavior over time
+5. **Compliance** — financial services audit requirements demand explainable, traceable knowledge evolution
+
+#### Infrastructure
+
+```
+ca-ltm-records      ← current state (records, sessions, checkpoints)
+ca-ltm-events       ← append-only event log (separate table)
+ca-ltm-snapshots    ← S3 bucket for monthly full-state snapshots
+```
+
+The event log lives in a **separate DynamoDB table** (`ca-ltm-events`). This separation is required because:
+- Events are append-only and never updated; records are mutable
+- The rebuild-from-scratch requirement means events must be independent of the table they reconstruct
+- Different throughput, retention, and backup characteristics
+
+#### MemoryEvent
+
+Every mutation produces a `MemoryEvent` containing a **full snapshot** of the record state after the mutation. Snapshots are chosen over deltas because they are tolerant of gaps, require no sequential replay ordering for individual record reconstruction, and DynamoDB storage is cheap.
+
+```typescript
+interface MemoryEvent {
+  eventId: string;                // ULID or UUID
+  timestamp: string;              // ISO timestamp
+
+  action:
+    | "created"
+    | "patched"
+    | "promoted"
+    | "deprecated"
+    | "archived"
+    | "verified"
+    | "marked_stale"
+    | "linked"
+    | "unlinked"
+    | "ttl_expired"
+    | "restored"
+    | "superseded"
+    | "review_approved"
+    | "review_rejected"
+    | "session_checkpoint"
+    | "session_resumed"
+    | "session_closed";
+
+  actor: "agent" | "human" | "system";
+  actorId?: string;               // user ID or agent ID
+  sessionId?: string;             // originating session
+
+  recordId: string;
+  recordType: RecordType | "session";
+
+  snapshot: Record<string, unknown>;  // full record state after mutation
+
+  reason?: string;                // human/agent-provided context for the change
+  triggerSource?: string;         // what caused this event (e.g., "checkpoint_trigger", "admin_ui", "promotion_pipeline")
+}
+```
+
+#### Event Table Schema — Dual-Write
+
+Every event is written as **two items** in a single `TransactWriteItems` call:
+
+| Write | PK | SK | Purpose |
+|---|---|---|---|
+| Global timeline | `"event"` | `{timestamp}#{eventId}` | Chronological replay, global queries |
+| Per-record history | `"event#{recordType}#{recordId}"` | `{timestamp}#{eventId}` | Full lifecycle of a single record |
+
+Both items contain the same `MemoryEvent` payload. No GSI required — dual-write gives both access patterns natively.
+
+**Access patterns:**
+
+| Query | How |
+|---|---|
+| Global timeline (all events) | `Query(PK="event", SK between start and end)` |
+| Events for a specific record | `Query(PK="event#migration#authz-policy-engine")` |
+| Events since last snapshot | `Query(PK="event", SK > lastSnapshotTimestamp)` |
+| Recent events by type | `Query(PK="event")` + `FilterExpression: action = "promoted"` |
+
+#### Event Sources
+
+All mutations generate events, regardless of origin:
+
+| Source | Actor | Examples |
+|---|---|---|
+| **Agent** | `"agent"` | Record created during session, auto-promotion, link inferred |
+| **Human** | `"human"` | Admin UI edits, review approval/rejection, manual verification |
+| **System** | `"system"` | TTL expiry, staleness detection, auto-archive, monthly snapshot |
+| **Session** | `"agent"` or `"human"` | Checkpoint saved, session resumed, session closed |
+
+#### SessionState Events
+
+SessionState mutations are **in-scope** for the event log. This is critical for:
+
+- **Debugging context assembly** — replay how context was built turn-by-turn to identify what was surfaced vs. what was missed
+- **Tuning retrieval** — analyze which records were pulled into session context and whether they were useful
+- **Measuring efficacy** — track session state size, token utilization, and bucket behavior over time
+
+SessionState events use `recordType: "session"` and `recordId: sessionId`. The snapshot contains the full `SessionState` after the mutation.
+
+At the expected user scale (small team), session event volume is manageable. If volume grows, session events can be moved to a separate partition prefix or given a shorter retention window without affecting durable record events.
+
+#### S3 Snapshots
+
+Monthly consolidated snapshots are stored in S3 as compressed JSON. A pointer record in `ca-ltm-events` references each snapshot.
+
+```
+ca-ltm-events table (pointer):
+  PK: "snapshot"
+  SK: "2026-04-01T00:00:00Z"
+  s3Key: "snapshots/2026-04-01.json.gz"
+  recordCount: 847
+  sizeBytes: 2_340_000
+  createdAt: "2026-04-01T00:05:00Z"
+
+S3:
+  s3://ca-ltm-snapshots/2026-04-01.json.gz
+```
+
+Full-state snapshots are necessary because a single DynamoDB item is limited to 400KB — far too small for a full memory dump at scale.
+
+**Snapshot contents:** Every record in `ca-ltm-records` at snapshot time, serialized as a JSON array, gzipped.
+
+#### Replay
+
+Rebuilding the records table from the event log:
+
+1. **Find nearest snapshot** — `Query(PK="snapshot", ScanIndexForward=false, Limit=1)`
+2. **Load snapshot from S3** — decompress, deserialize to record array
+3. **Apply subsequent events** — `Query(PK="event", SK > snapshotTimestamp)`, apply each event's snapshot as the current state for its `recordType#recordId`
+4. **Write to records table** — batch-write the reconstructed state
+
+**Point-in-time reconstruction:**
+- Same process, but stop applying events at the target timestamp
+- Answers: "What did CA-LTM know on March 15th?"
+
+**Per-record reconstruction:**
+- `Query(PK="event#migration#authz-policy-engine", SK <= targetTimestamp, ScanIndexForward=false, Limit=1)`
+- The most recent event snapshot before the target time *is* the record state — no replay needed
+
+#### Visualization Use Cases
+
+The event log enables the following visualization capabilities in the admin UI:
+
+| Visualization | Data Source | Value |
+|---|---|---|
+| **Global timeline** | `PK="event"` | "What happened to memory this week?" |
+| **Record life history** | `PK="event#{type}#{id}"` | "How did this migration record evolve from draft to resolved?" |
+| **Knowledge graph animation** | Global timeline filtered to `created`, `linked`, `deprecated` | "Watch the knowledge graph grow over Q1" |
+| **Point-in-time diff** | Two PITR reconstructions | "What changed between these two dates?" |
+| **Session state evolution** | Session events for a conversation | "Replay how context was built turn-by-turn" |
+| **Session efficiency metrics** | Aggregated session events | "Context size, token usage, bucket utilization over time" |
+| **Session misses & errors** | Session events + agent feedback signals | "What was needed but not surfaced? What was surfaced but irrelevant?" |
 
 ---
 
