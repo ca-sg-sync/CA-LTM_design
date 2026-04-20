@@ -1035,6 +1035,15 @@ Relationship navigation, migration dependency graph, playbook/incident linkage, 
 - A team lead opens the graph explorer and views the "Authz Policy Engine" migration node. It shows edges to: 3 related patterns, 2 dependent decisions, 1 blocking incident, and 5 affected systems. She immediately sees that the migration is blocked by an unresolved incident in the account-service — a dependency that wasn't visible from reading individual records. She clicks through to the incident and assigns follow-up.
 - An SRE views the "api-gateway" system node in the graph and sees all connected knowledge: 2 active migrations, 4 patterns, 3 playbooks, and 6 historical incidents. The cluster reveals that most incidents correlate with the auth migration period — confirming the team's suspicion that the migration is the root of recent instability. The timeline view shows incidents spiking after the migration's phase-2 milestone.
 
+### Phase 11b — Graph Timeline Playback
+**Extend:** `@ca-ltm/admin-ui` + `@ca-ltm/api`
+
+Animated timeline playback of the knowledge graph being constructed over time. Uses the event log (`GET /events/timeline`) to identify mutation timestamps and point-in-time reconstruction (`GET /events/reconstruct?timestamp=...`) to rebuild the graph state at each point. The user scrubs a timeline slider to watch nodes and edges appear, change status, and get archived — visualizing how institutional knowledge accumulated.
+
+**Example tasks this enables:**
+- A team lead opens the graph timeline, sets the range to the last 3 months, and hits play. She watches the "Authz Policy Engine" migration node appear, then sees pattern and decision nodes link to it over subsequent weeks. An incident node appears and connects with a `caused_by` edge — she can see exactly when the team learned the migration was causing instability, and how playbooks were added in response. The replay makes the knowledge evolution visible in a way that reading individual records cannot.
+- During a retrospective, the team plays back the last quarter's graph growth filtered to `type=incident`. They see incident clusters forming around the api-gateway system node, peaking in week 6, then declining after playbook and detection caveat records were added. The timeline visualization directly shows the ROI of capturing institutional knowledge — fewer repeated incidents after the knowledge was codified.
+
 ### Phase 12 — Verification & Staleness
 **Extend:** multiple modules
 
