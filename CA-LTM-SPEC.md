@@ -267,6 +267,8 @@ interface BaseRecord {
   };
 
   ttl?: number;              // epoch seconds, mainly for session_note
+
+  embeddingModel?: string;   // model that generated the embedding (e.g. "amazon.titan-embed-text-v2:0")
 }
 ```
 
@@ -501,7 +503,32 @@ function toDynamoKeys(record: BaseRecord) {
 
 At the expected scale (hundreds to low-thousands per type), `FilterExpression` is efficient. GSIs can be added later if access patterns demand it.
 
-### 6.4 SessionState Storage
+### 6.4 Embedding Storage
+
+Embeddings are stored as **separate items** in the same table, not inline on record items. This avoids inflating record reads with ~4 KB of vector data per record (~20x RCU increase if inline).
+
+| Attribute | Value | Type |
+|-----------|-------|------|
+| **PK** | `"embedding"` | String |
+| **SK** | `{recordType}#{recordId}` | String |
+| **vector** | Float32 array (1,024 dimensions, AWS Titan v2) | Binary |
+| **model** | Embedding model identifier | String |
+| **sourceText** | Concatenated text used to generate the embedding | String |
+| **computedAt** | ISO timestamp of last computation | String |
+
+**Access patterns:**
+
+| Pattern | How |
+|---------|-----|
+| Get one embedding | `GetItem(PK="embedding", SK="{type}#{id}")` |
+| All embeddings (for similarity search) | `Query(PK="embedding")` |
+| Embeddings by record type | `Query(PK="embedding", SK begins_with "{type}#")` |
+
+Embeddings are computed on record create and update. A `reindex` operation recomputes embeddings for all records (used when switching embedding models).
+
+**Model:** AWS Titan Embeddings v2 (`amazon.titan-embed-text-v2:0`), 1,024 dimensions. Stored as Binary (float32 array) — 4 KB per vector. At 1,000 records, the full embedding set is ~4 MB.
+
+### 6.5 SessionState Storage
 
 SessionState uses the same table:
 
@@ -517,7 +544,7 @@ Checkpoints:
 | **PK** | `"checkpoint"` |
 | **SK** | `{sessionId}#{timestamp}` |
 
-### 6.5 Relationship Storage
+### 6.6 Relationship Storage
 
 **V1:** Inline in `links` array on each record.
 
@@ -527,12 +554,12 @@ PK = "edge"
 SK = "{sourceType}#{sourceId}#{relationType}#{targetType}#{targetId}"
 ```
 
-### 6.6 TTL
+### 6.7 TTL
 
 - Applied to `session_note` records via DynamoDB TTL attribute.
 - Durable records do not expire.
 
-### 6.7 Event Log — Event-Sourced History
+### 6.8 Event Log — Event-Sourced History
 
 CA-LTM maintains an **append-only event log** that captures every mutation to the system. The event log is the source of truth — the records table (`ca-ltm-records`) is a materialized projection that can be rebuilt from scratch by replaying events, similar to git.
 
@@ -713,6 +740,10 @@ The event log enables the following visualization capabilities in the admin UI:
 - `ltm.markStale(type, id)` — flag record for re-verification
 - `ltm.linkRecords(a, relation, b)` — create relationship
 
+### Embedding APIs
+- `ltm.semanticSearch(query, filters?)` — embed query, cosine similarity against record embeddings, return ranked matches
+- `ltm.reindex(type?, id?)` — recompute embeddings for all records or a specific record/type
+
 ### Verification APIs
 - `ltm.verify(type, id, evidence)` — mark verified with evidence
 - `ltm.revalidate(filters)` — batch re-check records
@@ -803,6 +834,14 @@ type TaskType =
   | "domain_lookup";
 ```
 
+#### Classification Mechanism
+
+Task classification uses **embedding-based semantic similarity** via the `@ca-ltm/classifier` module. Each task type has pre-computed anchor embeddings derived from its description and example phrases. The user's input is embedded and compared against all anchors via cosine similarity — the highest-scoring type wins.
+
+**Fallback chain:** If the embedding provider is unavailable, classification falls back to keyword/regex pattern matching (the original v1 mechanism), then to `"mixed"` as the safe default.
+
+This replaces the original keyword-only classification, which missed semantic matches — e.g., "help me understand why we chose DynamoDB" is clearly `institutional_memory` but contains no keyword signals for that type.
+
 #### Classification Profiles
 
 | TaskType | Purpose | Queries CA-LTM? | Queries Sourcegraph? | Priority Record Types |
@@ -827,6 +866,184 @@ The original three types (`code_truth`, `institutional_memory`, `mixed`) only co
 Without scoped retrieval, the system returns the same ranked list regardless of intent — acceptable at small scale, but increasingly noisy as the memory store grows.
 
 **Default:** `mixed` — the safest fallback, queries everything.
+
+### 8.6 Hybrid Retrieval Flow
+
+When the orchestrator's recall flow needs to find relevant records, it delegates to the retrieval module, which executes a **four-stage hybrid retrieval pipeline**. This pipeline combines exact metadata filtering, keyword matching, and embedding-based vector search into a single ranked result set.
+
+#### Why Hybrid, Not Just Vector Search
+
+Pure vector search (embed query → cosine similarity → top-K) works well for open-ended similarity but has weaknesses that matter for institutional memory:
+
+- **Metadata must be exact.** When the task type is `operational`, the retrieval plan says "only surface playbooks, alert patterns, incident clusters, and detection caveats." Vector search cannot enforce this — a semantically similar migration record would score high even though the task type excludes it. Metadata filtering must come first.
+- **Keywords catch what embeddings miss.** A search for "SSM" should find every record mentioning SSM, regardless of semantic similarity. Keyword matching is precise and fast.
+- **Embeddings catch what keywords miss.** A search for "cross-account access" should find a record titled "IAM AssumeRole for multi-account operations" even though the words don't overlap. Semantic similarity bridges vocabulary gaps.
+- **Freshness and trust matter.** A verified record from last week is more valuable than an unverified record from last year, even if the older record scores higher on similarity.
+
+Hybrid retrieval combines all four signals. No single signal is sufficient alone.
+
+#### Stage 1 — Scope (exact, fast)
+
+The task classification result (§8.5) determines which record types to query and narrows the candidate set before any scoring:
+
+```
+TaskType → Retrieval Plan → Priority Record Types
+  "operational" → [playbook, alert_pattern, incident_cluster, detection_caveat]
+  "mixed"       → [all 10 types]
+```
+
+The retrieval module queries storage for records matching the priority types, optionally filtered by metadata:
+
+- `status` — typically `"active"` or `"draft"` (exclude archived/deprecated)
+- `relatedSystems` — if the session has `activeSystems`, scope to those
+- `relatedRepos` — if the query references specific repos
+
+This stage reduces the candidate set from potentially thousands of records to tens or low hundreds — the set that will be scored.
+
+**Cost:** DynamoDB queries with FilterExpression. Fast and cheap. No embeddings involved.
+
+#### Stage 2 — Score (three parallel signals)
+
+Every candidate record from Stage 1 is scored across three independent signals, computed in parallel:
+
+##### Signal A: Keyword Match
+
+Substring matching of the query against the record's searchable fields (title, summary, type-specific key fields). Returns a score based on:
+
+- Number of distinct query terms found
+- Whether matches are in the title (weighted higher) or body fields
+- Exact matches weighted higher than partial matches
+
+**Characteristics:** Fast, precise, zero false positives. Misses semantic matches ("cross-account" won't match "multi-account").
+
+##### Signal B: Semantic Similarity (Vector Search)
+
+The query is embedded using AWS Titan Embeddings v2 and compared via cosine similarity against pre-computed record embeddings stored in DynamoDB (`PK="embedding"`).
+
+```
+1. Embed the query text → 1,024-dimension vector
+2. Load record embeddings for candidate set (from Stage 1)
+3. Cosine similarity: query vector · record vector / (|query| × |record|)
+4. Score range: 0.0 (unrelated) to 1.0 (identical meaning)
+```
+
+**Characteristics:** Catches semantic matches that keywords miss. "Cross-account access patterns" matches "IAM AssumeRole for multi-account operations" because the concepts are semantically close. May produce false positives on superficially similar but contextually different content.
+
+**Embedding loading:** Record embeddings for the candidate set are loaded from DynamoDB in a single `Query(PK="embedding", SK begins_with "{type}#")` per record type. At typical scale (~50-200 candidates), this is 1-3 DynamoDB queries returning ~200-800 KB of Binary data — fast and cheap.
+
+##### Signal C: Freshness, Trust & Usage
+
+Metadata-derived signals that capture recency, verification status, and usage patterns:
+
+| Signal | Computation | Weight Rationale |
+|--------|------------|-----------------|
+| Recency | Decay function on `updatedAt` — newer records score higher | Recent knowledge is more likely to be relevant and accurate |
+| Verification | `verified` > `unverified` > `stale` > `conflicted` | Verified records are more trustworthy |
+| Usage | Boost based on `usage.readCount` and `usage.lastUsedByAgentAt` | Frequently used records are proven useful |
+| Confidence | `high` > `medium` > `low` | Higher confidence records are more reliable |
+
+**Characteristics:** No text analysis. Pure metadata. Differentiates between two records that score equally on content relevance.
+
+#### Stage 3 — Blend (weighted combination)
+
+The three signal scores are normalized to [0, 1] and combined with configurable weights:
+
+```typescript
+interface ScoringWeights {
+  keyword: number;     // default: 0.25
+  semantic: number;    // default: 0.45
+  freshness: number;   // default: 0.30
+}
+
+finalScore = (keyword × w.keyword) + (semantic × w.semantic) + (freshness × w.freshness)
+```
+
+**Why these defaults:**
+- **Semantic (0.45)** gets the highest weight because it catches the most important matches that other signals miss — the whole reason for adding embeddings.
+- **Freshness/trust (0.30)** is second because institutional memory must be trustworthy. A stale, unverified record scoring high on similarity should rank below a verified, recent record.
+- **Keyword (0.25)** is lowest because it is the most brittle signal (vocabulary-dependent) but provides precision that embeddings cannot — exact term matches should still be rewarded.
+
+Weights are configurable per deployment. The orchestrator can also override weights per task type — e.g., `domain_lookup` may increase keyword weight since glossary lookups benefit from exact term matching.
+
+#### Stage 4 — Top-K and Handoff
+
+Records are sorted by `finalScore` descending. The top K results (configurable, default: 10) are returned to the orchestrator, which passes them to the context assembler.
+
+```
+Top-K records → Context Assembler
+  → Priority bucket: "Relevant durable memory" (bucket 6 of 8)
+  → Token budget applied per bucket
+  → Records formatted as readable prompt text (not JSON)
+  → Pruned if total context exceeds cap
+```
+
+The context assembler does not re-rank. It trusts the retrieval ranking and applies only token budget constraints. If the durable memory bucket's token cap is reached, lower-ranked records are dropped.
+
+#### Full Flow Diagram
+
+```
+User input: "What do we know about cross-account access?"
+  │
+  ▼
+┌──────────────────────────────────────────────────────┐
+│ Stage 1: SCOPE                                       │
+│                                                      │
+│ Task classification → "institutional_memory"          │
+│ Priority types → migration, pattern, decision,        │
+│                   incident, session_note              │
+│ Metadata filter → status in (active, draft)           │
+│ Result: 47 candidate records                          │
+└──────────────────────┬───────────────────────────────┘
+                       ▼
+┌──────────────────────────────────────────────────────┐
+│ Stage 2: SCORE (parallel)                            │
+│                                                      │
+│ ┌─────────────┐ ┌──────────────┐ ┌────────────────┐ │
+│ │ A: Keyword   │ │ B: Semantic  │ │ C: Freshness   │ │
+│ │ "cross"      │ │ embed query  │ │ updatedAt      │ │
+│ │ "account"    │ │ cosine sim   │ │ verified?      │ │
+│ │ "access"     │ │ vs 47 record │ │ usage count    │ │
+│ │              │ │ embeddings   │ │ confidence     │ │
+│ │ hits: 12/47  │ │ all 47 scored│ │ all 47 scored  │ │
+│ └─────────────┘ └──────────────┘ └────────────────┘ │
+└──────────────────────┬───────────────────────────────┘
+                       ▼
+┌──────────────────────────────────────────────────────┐
+│ Stage 3: BLEND                                       │
+│                                                      │
+│ finalScore = (keyword × 0.25) +                      │
+│              (semantic × 0.45) +                     │
+│              (freshness × 0.30)                      │
+│                                                      │
+│ Sort by finalScore descending                        │
+└──────────────────────┬───────────────────────────────┘
+                       ▼
+┌──────────────────────────────────────────────────────┐
+│ Stage 4: TOP-K → Context Assembler                   │
+│                                                      │
+│ Top 10 records:                                      │
+│  1. "IAM AssumeRole multi-account" (pattern)   0.91  │
+│  2. "Cross-account S3 ownership" (incident)    0.87  │
+│  3. "STS temporary credentials" (pattern)      0.83  │
+│  4. "Authz policy engine migration" (migration)0.79  │
+│  5. ...                                              │
+│                                                      │
+│ → Formatted as prompt text                           │
+│ → Token budget: 2,000 tokens for durable memory      │
+│ → Records 8-10 pruned (over budget)                  │
+└──────────────────────────────────────────────────────┘
+```
+
+#### Fallback Behavior
+
+If the embedding provider is unavailable (network error, service outage, configuration disabled):
+
+1. **Signal B (semantic) is skipped.** Scoring uses only keyword + freshness.
+2. **Weights are rebalanced automatically:** keyword = 0.45, freshness = 0.55.
+3. **No error is returned.** The retrieval pipeline continues with degraded quality, not failure.
+4. **A warning is logged** so the issue is visible but not blocking.
+
+This ensures the system never fails to retrieve records. It may miss semantic matches during an outage, but metadata and keyword retrieval continue working.
 
 ---
 
@@ -884,6 +1101,8 @@ Require at least some of:
 | 9 | `@ca-ltm/api` | Backend service layer for UI/external access |
 | 10 | `@ca-ltm/admin-ui` | Human-facing inspection and management UI |
 | 11 | `@ca-ltm/harness` | Test runtime — simulated agent environment for E2E testing without OpenClaw |
+| 12 | `@ca-ltm/classifier` | Embedding-based classification and semantic search (AWS Titan v2) |
+| 13 | `@ca-ltm/importer` | Batch ingestion pipeline for historical/external knowledge sources |
 
 ### 10.2 Dependency Graph
 
@@ -892,15 +1111,21 @@ Require at least some of:
   ↓
 @ca-ltm/storage
   ↓
-@ca-ltm/retrieval
+@ca-ltm/classifier (embedding provider + anchor management)
+  ↓
+@ca-ltm/retrieval (uses classifier for semantic search)
   ↓
 @ca-ltm/context-assembler
 
-@ca-ltm/storage + retrieval + context-assembler + sourcegraph + promotion
+@ca-ltm/storage + retrieval + context-assembler + sourcegraph + promotion + classifier
   ↓
-@ca-ltm/orchestrator
+@ca-ltm/orchestrator (uses classifier for task classification)
   ├──→ @ca-ltm/openclaw-plugin   (production integration)
   └──→ @ca-ltm/harness           (test integration — replaces openclaw-plugin)
+
+@ca-ltm/domain + storage + promotion + classifier
+  ↓
+@ca-ltm/importer (batch ingestion — peer of orchestrator, not a dependency)
 
 @ca-ltm/openclaw-plugin
   ↓
@@ -911,6 +1136,8 @@ Require at least some of:
 
 Note: `@ca-ltm/harness` depends on orchestrator + all core modules. It does **not** depend on `@ca-ltm/openclaw-plugin` — it calls the orchestrator directly using CA-LTM's own types.
 
+Note: `@ca-ltm/importer` is a peer of the orchestrator — both depend on domain + storage, but they do not depend on each other. The orchestrator handles live sessions; the importer handles historical ingestion.
+
 ### 10.3 Boundary Rules
 
 - UI does **not** know DynamoDB shapes
@@ -919,6 +1146,8 @@ Note: `@ca-ltm/harness` depends on orchestrator + all core modules. It does **no
 - Context assembler does **not** fetch data — it decides what enters context
 - Domain has **no** I/O
 - Harness does **not** import OpenClaw — it calls the orchestrator directly
+- Classifier has **no** business logic — it embeds text and computes similarity
+- Importer does **not** run continuously — it is a batch tool for historical ingestion
 
 ---
 
@@ -1008,10 +1237,10 @@ Query hints on records, expand records into live code queries, launch from playb
 - A migration record for "authz policy engine" carries `sourcegraphQueries: ["repo:^github.com/org/main$ authz OR authorization OR policy"]`. When the agent needs to advise on an auth change, it executes this query against live Sourcegraph and returns current files and symbols — institutional intent ("migrate to policy engine") grounded against current code reality ("here are the 14 files still using legacy middleware").
 - A playbook for "websocket reconnect storm" includes a `queries` section with Sourcegraph searches for `WebSocketReconnectHandler` and `connectionPool.drain`. During an incident, the agent executes these saved queries to immediately locate the relevant code paths — instead of the engineer spending 20 minutes manually searching. The playbook effectively teaches the agent *how to investigate*.
 
-### Phase 9 — Retrieval v1
-**Module:** `@ca-ltm/retrieval`
+### Phase 9 — Retrieval v1 + Semantic Search
+**Modules:** `@ca-ltm/retrieval` + `@ca-ltm/classifier`
 
-Exact lookup, keyword search, metadata filtering, hybrid scoring. Semantic/embeddings only if needed.
+Exact lookup, keyword search, metadata filtering, and **embedding-based semantic similarity** via `@ca-ltm/classifier` using AWS Titan Embeddings v2. Hybrid scoring combines metadata filters (exact), keyword hits (precise), and cosine similarity against record embeddings (semantic) into a weighted blend. Embeddings are stored as separate DynamoDB items (`PK="embedding"`, Binary float32 vectors) to avoid inflating record reads.
 
 **Example tasks this enables:**
 - An engineer asks "what do we know about the token refresh flow?" The retrieval service searches across all record types, finds: an incident record about auth token refresh errors (keyword: "token refresh"), the cross-account access pattern (related system: "sts"), and a detection caveat about noisy auth alerts during migration — ranked by relevance. The agent synthesizes these into a grounded, multi-perspective answer.
