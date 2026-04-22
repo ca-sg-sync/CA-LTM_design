@@ -1,7 +1,7 @@
 # CA-LTM: Long-Term Memory System — Master Specification
 
-> **Author:** Lucio Flores
-> **Company:** [CleverAlpha Technologies](https://www.cleveralphatechnologies.com)
+### Lucio Flores — [CleverAlpha Technologies](https://www.cleveralphatechnologies.com)
+
 > **Version:** 0.1.0-draft
 > **Last Updated:** 2026-04-21
 > **Status:** Design — Pre-Implementation
