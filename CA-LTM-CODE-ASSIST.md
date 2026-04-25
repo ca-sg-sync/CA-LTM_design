@@ -694,7 +694,258 @@ In that case, add a small local model for autocomplete/quick refactors while kee
 
 ---
 
-## 16. What Code Assist Does NOT Do
+## 17. Agent Loop and Harness Requirements
+
+The system topology described above is necessary but not sufficient. To match the Amp/Cursor experience, the **remote agent loop** must be opinionated and iterative — not just "chat with tools." This section specifies the behaviors the OpenClaw runtime must implement (or that we must implement on top of OpenClaw) to deliver an Amp-like UX.
+
+### 17.1 Why This Matters
+
+OpenClaw is an agent **framework** — composable primitives for memory, tools, and orchestration. Amp/Cursor are agent **runtimes** — opinionated loops with built-in retry logic, working-set tracking, error-driven iteration, and proactive context assembly.
+
+The gap is not architectural. The gap is the loop.
+
+| Layer | Amp/Cursor | OpenClaw (default) | Code Assist (required) |
+|-------|-----------|-------------------|------------------------|
+| Topology | Cloud agent + local extension | Same as Code Assist | Same |
+| Tools | MCP + built-ins | MCP + custom | MCP + custom |
+| Memory | Opaque session memory | None by default | CA-LTM (typed, durable) |
+| **Agent loop** | **Opinionated, iterative, error-aware** | **Generic, single-pass** | **Must be opinionated** |
+| **Working set** | **Tracked implicitly** | **None** | **Explicit, in SessionState** |
+| **Error feedback** | **Automatic reinjection** | **Manual** | **Automatic** |
+| **Context selection** | **Smart file ranking** | **None** | **CA-LTM classifier + heuristics** |
+
+### 17.2 Action Schema
+
+All agent outputs are typed as a discriminated union of actions. The harness parses, validates, and executes each action.
+
+```typescript
+type Action =
+  | { type: "read";    file: string }
+  | { type: "search";  query: string; scope?: "local" | "sourcegraph" }
+  | { type: "edit";    file: string; diff: string }
+  | { type: "create";  file: string; content: string }
+  | { type: "delete";  file: string }
+  | { type: "run";     command: string; cwd?: string }
+  | { type: "ltm";     op: "search" | "get" | "related" | "bootstrap"; args: unknown }
+  | { type: "ask";     question: string }     // ask user for clarification
+  | { type: "done";    summary: string };     // task complete
+```
+
+**Why typed actions:**
+- Deterministic parsing — no fragile string extraction from LLM output
+- Each action has known approval rules (read auto-allowed, run requires approval)
+- Each action has known result shape that can be reinjected into context
+- The loop can decide when to stop (`done`) vs continue
+
+### 17.3 The Loop
+
+```
+┌─────────────────────────────────────────────────┐
+│                                                 │
+│   1. Build context                              │
+│      • System prompt                            │
+│      • CA-LTM assembled memory                  │
+│      • Working set (active files + recent ops)  │
+│      • Recent action results (errors, output)   │
+│      • Conversation history                     │
+│                                                 │
+│   2. Plan (LLM call)                            │
+│      → returns Action[] (one or more)           │
+│                                                 │
+│   3. For each action:                           │
+│      a. Validate                                │
+│      b. Request approval (if required)          │
+│      c. Execute (local bridge or remote tool)   │
+│      d. Capture result                          │
+│      e. Update working set                      │
+│      f. Append to action history                │
+│                                                 │
+│   4. Decide:                                    │
+│      • action was `done` → exit                 │
+│      • action was `ask` → wait for user         │
+│      • error in result → retry with error ctx   │
+│      • else → loop                              │
+│                                                 │
+└─────────────────────────────────────────────────┘
+```
+
+**Key properties:**
+- Loop continues until `done`, `ask`, max iterations, or user interrupt
+- Each iteration can produce multiple actions (batch reads, parallel searches)
+- Errors are first-class — they are reinjected into context, not thrown
+- The user can interrupt at any point
+
+### 17.4 Working Set Tracker
+
+The working set is the **explicit, in-context list of files and operations the agent is currently focused on**. It lives in SessionState and is reinjected into every turn's context.
+
+```typescript
+interface WorkingSet {
+  activeFiles: Array<{
+    path: string;
+    role: "editing" | "reading" | "test_target" | "reference";
+    lastTouchedAt: string;
+    lastDiff?: string;          // recent change for context
+  }>;
+  activeCommands: Array<{
+    command: string;
+    lastRunAt: string;
+    lastOutput?: string;        // truncated
+    lastExitCode?: number;
+  }>;
+  taskGoal?: string;            // current task description
+  taskStatus: "in_progress" | "blocked" | "verifying" | "done";
+}
+```
+
+**Why explicit:**
+- Without it, the agent re-discovers the working set every turn (wasteful, error-prone)
+- With it, the agent knows "I'm editing `auth.ts` and `auth.test.ts`, my test command is `npm test auth`, last run failed at line 42"
+- Survives compaction — restored on resume from SessionState
+
+**Updates:**
+- `read` action → adds file to working set as `reading`
+- `edit`/`create` → marks as `editing`, stores diff
+- `run` of a test command → adds as `test_target`
+- Working set entries decay (drop after N turns of no reference)
+
+### 17.5 Error-Driven Iteration
+
+When an action result indicates failure, the loop automatically reinjects the error into context for the next plan. This is the single biggest UX differentiator from "chat with tools."
+
+**Failure signals:**
+- `run` action with non-zero exit code
+- `edit` action where the diff doesn't apply cleanly
+- Test runner output containing failure markers
+- Compile/type-check errors in IDE diagnostics
+
+**Loop behavior:**
+
+```
+agent: { type: "edit", file: "auth.ts", diff: "..." }
+bridge: applies edit → success
+agent: { type: "run", command: "npm test auth" }
+bridge: runs → exits 1, output contains "expected 200, got 500"
+loop:  reinject error into next turn's context
+       working set updated: auth.test.ts marked as test_target with failure
+agent: { type: "read", file: "auth.test.ts" }
+       → understands test expectations
+agent: { type: "edit", file: "auth.ts", diff: "..." }  // fix attempt
+agent: { type: "run", command: "npm test auth" }
+bridge: runs → exits 0
+agent: { type: "done", summary: "Fixed auth handler to return 200..." }
+```
+
+**Retry budget:** Configurable max iterations (default 10) and max consecutive failures (default 3) per task to prevent runaway loops.
+
+### 17.6 Smart File Selection
+
+Beyond the editor context the IDE plugin sends, the agent needs **proactive file ranking** when starting a task — picking the top-K relevant files without crawling the whole repo.
+
+**Approach (phased):**
+
+| Phase | Mechanism |
+|-------|-----------|
+| MVP | Heuristic — recently edited files, files matching grep on task keywords, files referenced in active CA-LTM records |
+| Phase 4 | CA-LTM classifier embeddings against file paths and symbol names — semantic match between user query and file content |
+| Phase 5 | Sourcegraph code intelligence — symbol-level relevance for cross-repo tasks |
+
+**`local.repoMap` tool** — new local tool that returns a compressed structural overview:
+
+```typescript
+interface RepoMap {
+  root: string;
+  packageManagers: string[];   // npm, cargo, etc.
+  topLevelDirs: Array<{ path: string; fileCount: number }>;
+  entryPoints: string[];       // main, bin, index files
+  testDirs: string[];
+  configFiles: string[];       // tsconfig, package.json, etc.
+}
+```
+
+This is sent as part of session bootstrap so the agent has structural awareness without listing every file.
+
+### 17.7 New Local Tools
+
+The harness loop requires bridge tools beyond the basic file/git set:
+
+| Tool | Auto-Allow | Description |
+|------|-----------|-------------|
+| `local.repoMap` | ✅ | Structural overview |
+| `local.applyDiff` | ❌ | Apply unified diff (with approval) |
+| `local.runTests` | ❌ | Detected test command (with approval) |
+| `local.runBuild` | ❌ | Detected build command (with approval) |
+| `local.getDiagnostics` | ✅ | IDE-reported errors/warnings for a file |
+| `local.recentEdits` | ✅ | Files modified in last N minutes (workspace state) |
+
+### 17.8 Where the Loop Lives
+
+The loop runs **server-side**, inside the gateway or as a thin layer between the gateway and OpenClaw:
+
+```
+Gateway WebSocket
+    │
+    ▼
+┌────────────────────────────┐
+│   Agent Loop Controller    │
+│                            │
+│   • Builds context         │
+│   • Calls OpenClaw         │
+│   • Parses Actions         │
+│   • Routes tool calls      │
+│   • Reinjects results      │
+│   • Manages working set    │
+│   • Decides when to stop   │
+└──────────────┬─────────────┘
+               │
+               ▼
+         OpenClaw + vLLM
+```
+
+**Why server-side:**
+- Centralized — all UX consistency, retry logic, working set rules in one place
+- Auditable — every loop iteration emits CA-LTM events
+- Updatable — improving the loop benefits all clients without plugin updates
+- CA-LTM-integrated — orchestrator and context-assembler are right there
+
+### 17.9 Module Placement
+
+The agent loop is large enough to warrant its own module:
+
+**`@ca-ltm/agent-loop`** — new module
+
+**Responsibilities:**
+- Action schema definition and validation
+- Loop execution
+- Working set management
+- Error-driven retry logic
+- Tool routing decisions (local vs remote)
+- Iteration/failure budgets
+
+**Dependencies:**
+- `@ca-ltm/domain` — types
+- `@ca-ltm/storage` — SessionState (working set persistence)
+- `@ca-ltm/orchestrator` — recall flow before each loop iteration
+- `@ca-ltm/context-assembler` — context bundle assembly
+- OpenClaw client — model calls
+
+This module is independent of the IDE gateway. The gateway calls into it; the agent-loop calls into OpenClaw and CA-LTM.
+
+### 17.10 Phased Implementation
+
+| Phase | Loop Capability |
+|-------|----------------|
+| **Phase 1 MVP** | Single-pass — user message → context → LLM → response. No loop yet. Just chat. |
+| **Phase 2** | Action schema + simple loop — agent emits actions, harness executes, results reinjected. No retry logic. |
+| **Phase 3** | Working set tracking + persistence in SessionState |
+| **Phase 4** | Error-driven iteration — test failures, diff conflicts, compile errors automatically reinjected |
+| **Phase 5** | Smart file selection via CA-LTM classifier embeddings |
+
+Phases 1–2 deliver "chat with tools." Phases 3–4 deliver Amp-like UX. Phase 5 makes it specific to CleverAlpha's codebase.
+
+---
+
+## 18. What Code Assist Does NOT Do
 
 - **Does not run a local agent.** The agent brain is remote (OpenClaw on NemoClaw).
 - **Does not index or store code.** Code truth is the local filesystem. Cross-repo search is Sourcegraph.
