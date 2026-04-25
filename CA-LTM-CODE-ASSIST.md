@@ -328,7 +328,28 @@ interface IdeSession {
 }
 ```
 
-### 6.3 What Is NOT in Scope
+### 6.3 Branch-Aware Context
+
+Sessions are tied to a git branch. When the user switches branches mid-session, the context changes meaningfully — different files, different uncommitted state, different active task.
+
+**Behavior on branch change:**
+
+1. The local bridge detects branch change via `git status` polling or filesystem watch on `.git/HEAD`
+2. Bridge emits `{ type: "workspace.branchChanged", from, to, head }` to the gateway
+3. Agent loop:
+   - Updates session metadata (`branch`, `gitHead`)
+   - Invalidates branch-scoped caches (file tree, recent diffs)
+   - Re-fetches the working set's files (their content may have changed)
+   - Adds a system note to the conversation: `"Branch switched: feature/auth → main"`
+4. CA-LTM retrieval scoping:
+   - If memory records have `relatedRepos` or branch-related tags, the orchestrator can re-scope retrieval
+   - Active migrations relevant to the new branch take priority
+
+**Why this matters:** Without branch awareness, the agent will reason about stale context after a branch switch — referencing files that no longer exist, suggesting changes against the wrong base. This is a common failure mode in long-running coding sessions.
+
+**Continue.dev parallel:** Continue keys its codebase index by `{directory, branch}` for the same reason. Our retrieval pipeline should follow this pattern for any branch-sensitive caching (file content, diffs, indexed embeddings if/when local indexing is added).
+
+### 6.4 What Is NOT in Scope
 
 - Shared workspace-wide memory across multiple chat tabs
 - Multi-user collaborative sessions
@@ -720,15 +741,18 @@ All agent outputs are typed as a discriminated union of actions. The harness par
 
 ```typescript
 type Action =
-  | { type: "read";    file: string }
-  | { type: "search";  query: string; scope?: "local" | "sourcegraph" }
-  | { type: "edit";    file: string; diff: string }
-  | { type: "create";  file: string; content: string }
-  | { type: "delete";  file: string }
-  | { type: "run";     command: string; cwd?: string }
-  | { type: "ltm";     op: "search" | "get" | "related" | "bootstrap"; args: unknown }
-  | { type: "ask";     question: string }     // ask user for clarification
-  | { type: "done";    summary: string };     // task complete
+  | { type: "read";     files: string[] }                                  // batched read
+  | { type: "search";   query: string; scope?: "local" | "sourcegraph" }
+  | { type: "edit";     file: string; diff: string }
+  | { type: "create";   file: string; content: string }
+  | { type: "delete";   file: string }
+  | { type: "run";      command: string; cwd?: string }
+  | { type: "ltm";      op: "search" | "get" | "related" | "bootstrap"; args: unknown }
+  | { type: "delegate"; task: string; files?: string[]; instructions: string }   // sub-agent
+  | { type: "consult";  task: string; context?: string; files?: string[] }       // oracle/synthesis
+  | { type: "writeDoc"; file: string; content: string; intent: "plan" | "summary" | "approval_request" }
+  | { type: "ask";      question: string }     // ask user for clarification
+  | { type: "done";     summary: string };     // task complete
 ```
 
 **Why typed actions:**
@@ -736,6 +760,22 @@ type Action =
 - Each action has known approval rules (read auto-allowed, run requires approval)
 - Each action has known result shape that can be reinjected into context
 - The loop can decide when to stop (`done`) vs continue
+
+**Action design notes (from observed Amp behavior):**
+
+- **`read` is always batched.** Amp typically reads 4–10 files per turn during discovery. Forcing one-at-a-time reads is a UX/latency regression.
+- **`delegate` enables sub-agent task batches.** For multi-file refactors, the agent groups files by concern and delegates each group to a sub-agent with structured instructions. The 11-file refactor in our test corpus used 5 such batches.
+- **`consult` is for synthesis, not coding.** Use this when the task needs architectural reasoning (oracle-style) — review, planning, alternative analysis — rather than direct code modification.
+- **`writeDoc` persists plans to disk.** Amp writes `docs/proposed-architecture.md` and similar artifacts before executing. This serves as both a working-memory anchor and a user approval surface.
+
+**Tool injection for non-function-calling models.** Not all models that vLLM serves natively support OpenAI-style function calling. The agent loop must support both modes:
+
+| Mode | When | How |
+|---|---|---|
+| **Native function calling** | Model supports `tools` parameter (Claude, GPT-4, Llama 3.1+ with grammar) | Pass tool schemas as `tools` in the API request; parse `tool_calls` from response |
+| **System-message injection** | Model has no native tool support | Inject XML-tagged tool descriptions into the system prompt; parse XML codeblocks from the model's text output back into `Action` objects |
+
+Each `Action` type carries both a JSON schema (for native mode) and an XML serialization template (for injection mode). The loop selects automatically based on model capabilities reported by the OpenClaw runtime. This is taken directly from Continue.dev's `buildToolsSystemMessage` / `interceptSystemToolCalls` pattern and is essential for vLLM portability across model families.
 
 ### 17.3 The Loop
 
@@ -775,6 +815,31 @@ type Action =
 - Errors are first-class — they are reinjected into context, not thrown
 - The user can interrupt at any point
 
+**Cancellation (critical UX).** The user must be able to cancel at any point — mid-token-stream, mid-tool-call, mid-batch. Without this, runaway loops or wrong-direction reasoning waste real money and time.
+
+**Mechanism:**
+- Every loop iteration is bound to an `AbortController` keyed by `messageId` (Continue.dev pattern)
+- The controller is held in a server-side `Map<messageId, AbortController>` in the agent loop module
+- Abort signal is propagated to: LLM streaming call, in-flight tool calls (local and remote), pending edits
+
+**UX trigger (matches Amp):**
+- **Double-Esc** in the IDE chat panel cancels the current operation
+- First Esc moves focus / dismisses popups; second Esc within ~500ms triggers cancel
+- Plugin sends `{ type: "cancel", messageId }` over the WebSocket
+- Gateway routes to the agent loop, which calls `controller.abort()`
+- Loop catches `AbortError`, marks the turn as `cancelled`, persists working set, returns control to user
+
+**What cancellation does NOT do:**
+- Does not roll back already-applied edits (those are user-approved and committed to disk)
+- Does not delete the partial assistant message (user may want to see what was thought)
+- Does not destroy the SessionState — the working set and findings up to the cancellation point are preserved
+
+**What cancellation DOES do:**
+- Stops the LLM stream immediately
+- Cancels all in-flight tool calls (best-effort for local exec — sends SIGTERM, then SIGKILL after grace period)
+- Marks `taskStatus: "cancelled"` in the working set
+- Returns the chat to a state where the user can issue a new message
+
 ### 17.4 Working Set Tracker
 
 The working set is the **explicit, in-context list of files and operations the agent is currently focused on**. It lives in SessionState and is reinjected into every turn's context.
@@ -792,6 +857,16 @@ interface WorkingSet {
     lastRunAt: string;
     lastOutput?: string;        // truncated
     lastExitCode?: number;
+  }>;
+  agentDocs: Array<{            // plans/summaries the agent wrote to disk
+    path: string;
+    intent: "plan" | "summary" | "approval_request";
+    createdAt: string;
+  }>;
+  knownNoise: Array<{           // pre-existing failures to filter from verification
+    pattern: string;            // grep pattern, file path, or test name
+    reason: string;             // "pre-existing test failure unrelated to task"
+    discoveredAt: string;
   }>;
   taskGoal?: string;            // current task description
   taskStatus: "in_progress" | "blocked" | "verifying" | "done";
@@ -838,6 +913,23 @@ agent: { type: "done", summary: "Fixed auth handler to return 200..." }
 
 **Retry budget:** Configurable max iterations (default 10) and max consecutive failures (default 3) per task to prevent runaway loops.
 
+**Tool fallback chains.** Retry is not always the right response. When a tool returns empty/stale results, the loop should try alternative tool paths before giving up. Observed example from Amp: Sourcegraph returned an empty file → pivoted to `commit_history` → got latest OID → re-fetched with explicit OID → succeeded. This is fallback, not retry — different tool path, same goal.
+
+**Git as recovery.** The loop knows git operations as safety nets:
+- `local.gitStash` — save in-progress edits before risky operations
+- `local.gitMergeAbort` — undo bad pulls/merges
+- `local.gitRestore` — revert specific files to HEAD
+- `local.gitDiff` — verify what changed before declaring `done`
+
+When the loop detects unexpected workspace state (uncommitted changes it didn't make, merge conflict markers, etc.), it should consult git rather than blindly proceeding.
+
+**Filtered verification.** The loop must distinguish between **failures it caused** and **pre-existing noise**. When a build/test fails, the loop:
+1. Checks if the failure is in `workingSet.knownNoise`
+2. If yes, filters the failure out and continues
+3. If no, treats it as a real signal and reacts
+
+This matches Amp's pattern of `tsc --noEmit 2>&1 | grep -v "known.test.ts"` — verify only the parts the agent is responsible for.
+
 ### 17.6 Smart File Selection
 
 Beyond the editor context the IDE plugin sends, the agent needs **proactive file ranking** when starting a task — picking the top-K relevant files without crawling the whole repo.
@@ -865,6 +957,25 @@ interface RepoMap {
 
 This is sent as part of session bootstrap so the agent has structural awareness without listing every file.
 
+### 17.6.5 Ask-vs-Assume Policy
+
+The loop applies an explicit policy for when to ask vs proceed on assumption. This is a behavioral pattern observed consistently in Amp and is critical for good UX — both over-asking and over-assuming degrade trust.
+
+**Assume (proceed without asking):**
+- Technical conventions of the language/framework (`.js` extensions in ESM, `package-lock.json` for `npm ci`, default test runner)
+- Standard refactoring patterns (extract function, rename variable)
+- Code style consistent with surrounding files
+- Obvious type signatures from context
+
+**Ask (block on user clarification):**
+- Business/domain context (naming, terminology, regulatory framing)
+- Ambiguous scope (which of N similar files, breadth of refactor)
+- Destructive operations beyond the obvious (deleting files, dropping data)
+- Architectural choices with multiple valid options (auth strategy, storage backend)
+- When confidence is low and the cost of a wrong answer is high
+
+**Implementation:** This policy lives in the system prompt and is reinforced by the action schema — `ask` is a first-class action, not an exception path. The loop's planning step should explicitly consider "do I need to ask, or can I proceed?" before emitting other actions.
+
 ### 17.7 New Local Tools
 
 The harness loop requires bridge tools beyond the basic file/git set:
@@ -877,6 +988,11 @@ The harness loop requires bridge tools beyond the basic file/git set:
 | `local.runBuild` | ❌ | Detected build command (with approval) |
 | `local.getDiagnostics` | ✅ | IDE-reported errors/warnings for a file |
 | `local.recentEdits` | ✅ | Files modified in last N minutes (workspace state) |
+| `local.gitStash` | ❌ | Stash uncommitted changes (with approval) |
+| `local.gitMergeAbort` | ❌ | Abort an in-progress merge (with approval) |
+| `local.gitRestore` | ❌ | Restore file(s) to HEAD (with approval) |
+
+**Note on batched reads:** `local.readFile` accepts an array of paths in a single call. This matches Amp's observed pattern of 4–10 file reads per discovery turn — issuing them as one tool call is significantly faster than N round trips.
 
 ### 17.8 Where the Loop Lives
 
@@ -942,6 +1058,39 @@ This module is independent of the IDE gateway. The gateway calls into it; the ag
 | **Phase 5** | Smart file selection via CA-LTM classifier embeddings |
 
 Phases 1–2 deliver "chat with tools." Phases 3–4 deliver Amp-like UX. Phase 5 makes it specific to CleverAlpha's codebase.
+
+### 17.11 UX Patterns from Amp
+
+These are behavioral/UX patterns observed in Amp that are not strictly part of the loop but materially affect the user experience. The IDE plugin should support them.
+
+**Render rich content in chat.** The plugin must render:
+- Markdown (formatting, code blocks with syntax highlighting)
+- Mermaid diagrams (architectural approval gates)
+- Diff previews (inline, side-by-side toggle)
+- Tool-call cards (collapsible — show tool name, args, result summary)
+- Status updates ("Read 7 files", "Build passed", "Delegated 5 tasks")
+
+**Plan-as-artifact pattern.** When the agent uses `writeDoc` to persist a plan (e.g., `docs/proposed-architecture.md`):
+- The plugin shows a preview card in chat with "View full doc" link
+- The user can edit the doc directly in the IDE before approving
+- The agent re-reads the doc on the next turn to pick up edits
+
+**Approval gates for architectural changes.** Before executing multi-file edits:
+- Agent emits a `writeDoc` with `intent: "approval_request"` containing a Mermaid diagram or structured plan
+- Plugin renders it with explicit "Approve" / "Reject" / "Edit" buttons
+- Loop pauses on `ask`-equivalent state until user responds
+
+**Status updates after batches.** After `delegate` or `read` (batched), the agent should emit a brief status message:
+- "Read 7 files in src/auth/"
+- "Delegated 5 sub-tasks for the Finance → Universe rename"
+- "Build passed (filtered 1 known noise)"
+
+These are streamed to the plugin as `assistant.status` messages, distinct from `assistant.token`.
+
+**Continuity references.** When resuming a session or referencing prior work:
+- Agent surfaces "Continuing from [thread/checkpoint] — last objective: ..."
+- Plugin renders these as breadcrumbs at the top of the chat
+- Maps directly to CA-LTM SessionState resume
 
 ---
 
